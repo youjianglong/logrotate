@@ -8,5 +8,7 @@ authors = ["XiaoYao<you.jianglong@gmail.com>"]
 
 [dependencies]
 chrono = "0.4.26"
-clap = { version="4.4.0", features=["derive"] }
+clap = { version="4.4.0", features=["derive", "env"] }
 ctrlc = { version="3.4.0", features=["termination"] }
+libflate = "2"
+toml = { version="0.8.15", default-features = false, features = ["parse"] }
