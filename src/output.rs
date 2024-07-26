@@ -1,11 +1,12 @@
 use chrono::{DateTime, Local};
 use clap::ValueEnum;
 use fs::File;
+use libflate::gzip::Encoder;
 use std::cell::RefCell;
 use std::fmt::Debug;
 use std::fs;
 use std::io;
-use std::io::{Error, ErrorKind, Write};
+use std::io::{Error, ErrorKind, Write, copy};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
@@ -43,7 +44,9 @@ impl Output {
         path: Option<String>,
         mode: CutMode,
         file_size: Option<u64>,
+        compress: bool,
         running: Arc<AtomicBool>,
+        interval: u64,
     ) -> (Self, JoinHandle<()>) {
         let log_path = match path {
             Some(s) => s,
@@ -54,10 +57,10 @@ impl Output {
         let fsh = flushing.clone();
         let jh = match mode {
             CutMode::Size => thread::spawn(move || {
-                SizeRotate::new(log_path, receiver, file_size).timed(running, fsh)
+                SizeRotate::new(log_path, receiver, file_size, compress).timed(running, fsh, interval)
             }),
             CutMode::Daily => {
-                thread::spawn(move || DailyRotate::new(log_path, receiver).timed(running, fsh))
+                thread::spawn(move || DailyRotate::new(log_path, receiver, compress).timed(running, fsh, interval))
             }
         };
 
@@ -111,16 +114,18 @@ trait Rotate {
 
     // Rotates the filename by appending the current day to it
     // If the rotated filename already exists, it appends a unique identifier to it
-    fn rotate_filename(path: &String) -> String {
-        let day = Self::day();
-        let mut filename = path.clone() + "." + day.as_str();
-        if !Self::is_file(&filename) {
-            return filename;
+    fn rotate_filename(path: &String, compress:bool, mul:bool) -> String {
+      let day = Self::day();
+        if !mul {
+          let filename = path.clone() + "." + day.as_str();
+          if compress && !Self::gzip_exists(&filename) || !compress && !Self::is_file(&filename) {
+              return filename;
+          }
         }
         let mut i = 1;
         loop {
-            filename = format!("{:}.{:}.{:}", path, i, day);
-            if !Self::is_file(&filename) {
+            let filename = format!("{:}.{:}.{:}", path, day, i);
+            if (compress && !Self::gzip_exists(&filename)) || (!compress && !Self::is_file(&filename)) {
                 return filename;
             }
             i += 1;
@@ -188,17 +193,32 @@ trait Rotate {
     // Sleeps for one second, then calls the `sync()` method to synchronize the data
     // If the `flushing` bool is true, it calls the `flush()` method to flush the file contents
     // Prints a message when starting the flush process
-    fn timed(&mut self, running: Arc<AtomicBool>, flushing: Arc<AtomicBool>) {
-        let dur = time::Duration::from_secs(1);
+    fn timed(&mut self, running: Arc<AtomicBool>, flushing: Arc<AtomicBool>, interval:u64) {
+        let dur = time::Duration::from_secs(interval);
         while running.load(Ordering::SeqCst) {
             thread::sleep(dur);
             self.sync();
             if flushing.swap(false, Ordering::SeqCst) {
-                println!("flushing ...");
                 self.flush();
             }
         }
+        self.sync();
         self.close();
+    }
+
+    fn gzip_encode(filename: &String) -> io::Result<()> {
+        let mut inp = File::open(filename)?;
+        let out = File::create(format!("{}.gz", filename))?;
+        let mut encoder = Encoder::new(out)?;
+        copy(&mut inp, &mut encoder)?;
+        drop(inp);
+        drop(encoder.finish().into_result()?);
+        fs::remove_file(filename)?;
+        Ok(())
+    }
+
+    fn gzip_exists(filename:&String) -> bool {
+      Self::is_file(&format!("{}.gz", filename))
     }
 
     fn receive(&mut self) -> Result<Vec<u8>, TryRecvError>;
@@ -214,10 +234,11 @@ struct SizeRotate {
     size_limit: u64,             // The maximum size limit for the file
     cur_size: u64,               // The current size of the file
     file: RefCell<Option<File>>, // The file being written (wrapped in a RefCell)
+    compress: bool,              // Whether to compress the file
 }
 
 impl SizeRotate {
-    fn new(path: String, receiver: Receiver<Vec<u8>>, file_size: Option<u64>) -> Self {
+    fn new(path: String, receiver: Receiver<Vec<u8>>, file_size: Option<u64>, compress:bool) -> Self {
         let slo = file_size.or_else(|| Some(1024 * 1024 * 20)); // If file_size is None, set it to 20MB (default)
 
         Self {
@@ -226,6 +247,7 @@ impl SizeRotate {
             size_limit: slo.unwrap(), // Initialize size_limit field with the value of slo
             cur_size: 0,              // Initialize cur_size field with 0
             file: RefCell::default(), // Initialize file field with a default value
+            compress,                 // Initialize compress field with the provided compress argument
         }
     }
 }
@@ -260,10 +282,14 @@ impl Rotate for SizeRotate {
             println!("Failed to flush the file: {:+?}", err);
         }
         drop(fp);
-        let new_filename = Self::rotate_filename(&self.path);
+        let new_filename = Self::rotate_filename(&self.path, self.compress, true);
         println!("Move file: {:?} -> {:?}", self.path, new_filename);
-        if let Err(err) = fs::rename(self.path.clone(), new_filename) {
+        if let Err(err) = fs::rename(self.path.clone(), &new_filename) {
             println!("Failed to move the file: {:+?}", err)
+        } else {
+          if self.compress {
+            Self::gzip_encode(&new_filename)?;
+          }
         }
         self.get_file(data)
     }
@@ -288,16 +314,18 @@ struct DailyRotate {
     receiver: Receiver<Vec<u8>>, // The receiver end of a channel that receives byte vectors
     file: RefCell<Option<File>>, // A mutable reference to an optional file
     create_day: String,          // The day when the file was created
+    compress: bool,              // Whether to compress the rotated files
 }
 
 impl DailyRotate {
     // Constructs a new instance of DailyRotate
-    fn new(path: String, receiver: Receiver<Vec<u8>>) -> Self {
+    fn new(path: String, receiver: Receiver<Vec<u8>>, compress:bool) -> Self {
         Self {
             path,                      // Assigns the given path to the path field
             receiver,                  // Assigns the given receiver to the receiver field
             file: RefCell::default(),  // Initializes the file field as an empty option
             create_day: String::new(), // Initializes the create_day field as an empty string
+            compress,                  // Assigns the given compress flag to the compress field
         }
     }
 }
@@ -336,10 +364,14 @@ impl Rotate for DailyRotate {
         }
         drop(fp);
 
-        let new_filename = Self::rotate_filename(&self.path);
+        let new_filename = Self::rotate_filename(&self.path, self.compress, false);
         println!("Move file: {:} -> {:}", self.path, new_filename);
-        if let Err(err) = fs::rename(self.path.clone(), new_filename) {
+        if let Err(err) = fs::rename(self.path.clone(), &new_filename) {
             println!("Failed to move the file: {:+?}", err);
+        } else {
+          if self.compress {
+            Self::gzip_encode(&new_filename)?;
+          }
         }
         self.get_file(data)
     }
