@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::fmt::Debug;
 use std::fs;
 use std::io;
-use std::io::{Error, ErrorKind, Write, copy};
+use std::io::{copy, Error, ErrorKind, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
@@ -21,111 +21,35 @@ pub(crate) enum CutMode {
     Daily, // Represents the mode for cutting logs on a daily basis
 }
 
-#[derive(Debug)]
-pub(crate) struct Output {
-    sender: SyncSender<Vec<u8>>, // Sender for sending log data
-    flushing: Arc<AtomicBool>,   // Atomic boolean flag for indicating if a flush is requested
-}
-
-impl Output {
-    /// Creates a new `Output` instance.
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - An optional path for the log files.
-    /// * `mode` - The `CutMode` for cutting log files.
-    /// * `file_size` - An optional maximum size for log files.
-    /// * `running` - An `Arc<AtomicBool>` indicating if the logger is running.
-    ///
-    /// # Returns
-    ///
-    /// Returns a tuple containing the `Output` instance and a `JoinHandle<()>`.
-    pub fn new(
-        path: Option<String>,
-        mode: CutMode,
-        file_size: Option<u64>,
-        compress: bool,
-        running: Arc<AtomicBool>,
-        interval: u64,
-    ) -> (Self, JoinHandle<()>) {
-        let log_path = match path {
-            Some(s) => s,
-            None => String::from("output"),
-        };
-        let (sender, receiver) = sync_channel(64);
-        let flushing = Arc::new(AtomicBool::new(false));
-        let fsh = flushing.clone();
-        let jh = match mode {
-            CutMode::Size => thread::spawn(move || {
-                SizeRotate::new(log_path, receiver, file_size, compress).timed(running, fsh, interval)
-            }),
-            CutMode::Daily => {
-                thread::spawn(move || DailyRotate::new(log_path, receiver, compress).timed(running, fsh, interval))
-            }
-        };
-
-        let output = Self { sender, flushing };
-
-        (output, jh)
-    }
-}
-
-impl Write for Output {
-    /// Writes the provided buffer to the log sender.
-    ///
-    /// # Arguments
-    ///
-    /// * `buf` - A slice representing the buffer to be written.
-    ///
-    /// # Returns
-    ///
-    /// Returns an `io::Result` indicating the success of the write operation.
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Err(err) = self.sender.send(buf.to_vec()) {
-            return Err(Error::new(ErrorKind::Other, err));
-        }
-        Ok(buf.len())
-    }
-
-    /// Flushes the log sender by setting the flushing flag to true.
-    ///
-    /// # Returns
-    ///
-    /// Returns an `io::Result` indicating the success of the flush operation.
-    fn flush(&mut self) -> io::Result<()> {
-        self.flushing.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
 const DATE_FMT: &str = "%Y-%m-%d"; // Date format: Year-Month-Day
 
 // Define a trait named "Rotate"
 trait Rotate {
     // Returns the current day as a string in a specific format
-    fn day() -> String {
+    fn day(&self) -> String {
         Local::now().format(DATE_FMT).to_string()
     }
 
     // Checks if a file exists at the given path
-    fn is_file(path: &String) -> bool {
+    fn is_file(&self, path: &String) -> bool {
         return fs::metadata(path).is_ok_and(|meta| meta.is_file());
     }
 
     // Rotates the filename by appending the current day to it
     // If the rotated filename already exists, it appends a unique identifier to it
-    fn rotate_filename(path: &String, compress:bool, mul:bool) -> String {
-      let day = Self::day();
+    fn rotate_filename(&self, path: &String, compress: bool, mul: bool) -> String {
+        let day = self.day();
         if !mul {
-          let filename = path.clone() + "." + day.as_str();
-          if compress && !Self::gzip_exists(&filename) || !compress && !Self::is_file(&filename) {
-              return filename;
-          }
+            let filename = path.clone() + "." + day.as_str();
+            if compress && !self.gzip_exists(&filename) || !compress && !self.is_file(&filename) {
+                return filename;
+            }
         }
         let mut i = 1;
         loop {
             let filename = format!("{:}.{:}.{:}", path, day, i);
-            if (compress && !Self::gzip_exists(&filename)) || (!compress && !Self::is_file(&filename)) {
+            if (compress && !self.gzip_exists(&filename)) || (!compress && !self.is_file(&filename))
+            {
                 return filename;
             }
             i += 1;
@@ -135,7 +59,7 @@ trait Rotate {
     // Opens a file at the given path and returns a tuple containing the file handle and its metadata
     // If the file does not exist, it creates a new file and returns the file handle without metadata
     // Prints an error message if there is an error opening or creating the file
-    fn open_file(path: &str) -> io::Result<(File, Option<fs::Metadata>)> {
+    fn open_file(&self, path: &str) -> io::Result<(File, Option<fs::Metadata>)> {
         match fs::metadata(path) {
             Ok(meta) => File::options()
                 .append(true)
@@ -153,7 +77,7 @@ trait Rotate {
 
     // Flushes the contents of the file handle to disk
     // Prints an error message if there is an error flushing the file
-    fn file_flush(file: &Option<File>) {
+    fn file_flush(&self, file: &Option<File>) {
         if let Some(mut fp) = file.as_ref() {
             if let Err(err) = fp.flush() {
                 println!("Failed to flush file: {:+?}", err)
@@ -193,7 +117,7 @@ trait Rotate {
     // Sleeps for one second, then calls the `sync()` method to synchronize the data
     // If the `flushing` bool is true, it calls the `flush()` method to flush the file contents
     // Prints a message when starting the flush process
-    fn timed(&mut self, running: Arc<AtomicBool>, flushing: Arc<AtomicBool>, interval:u64) {
+    fn timed(&mut self, running: Arc<AtomicBool>, flushing: Arc<AtomicBool>, interval: u64) {
         let dur = time::Duration::from_secs(interval);
         while running.load(Ordering::SeqCst) {
             thread::sleep(dur);
@@ -206,7 +130,7 @@ trait Rotate {
         self.close();
     }
 
-    fn gzip_encode(filename: &String) -> io::Result<()> {
+    fn gzip_encode(&self, filename: &String) -> io::Result<()> {
         let mut inp = File::open(filename)?;
         let out = File::create(format!("{}.gz", filename))?;
         let mut encoder = Encoder::new(out)?;
@@ -217,8 +141,8 @@ trait Rotate {
         Ok(())
     }
 
-    fn gzip_exists(filename:&String) -> bool {
-      Self::is_file(&format!("{}.gz", filename))
+    fn gzip_exists(&self, filename: &String) -> bool {
+        self.is_file(&format!("{}.gz", filename))
     }
 
     fn receive(&mut self) -> Result<Vec<u8>, TryRecvError>;
@@ -238,7 +162,12 @@ struct SizeRotate {
 }
 
 impl SizeRotate {
-    fn new(path: String, receiver: Receiver<Vec<u8>>, file_size: Option<u64>, compress:bool) -> Self {
+    fn new(
+        path: String,
+        receiver: Receiver<Vec<u8>>,
+        file_size: Option<u64>,
+        compress: bool,
+    ) -> Self {
         let slo = file_size.or_else(|| Some(1024 * 1024 * 20)); // If file_size is None, set it to 20MB (default)
 
         Self {
@@ -247,7 +176,7 @@ impl SizeRotate {
             size_limit: slo.unwrap(), // Initialize size_limit field with the value of slo
             cur_size: 0,              // Initialize cur_size field with 0
             file: RefCell::default(), // Initialize file field with a default value
-            compress,                 // Initialize compress field with the provided compress argument
+            compress, // Initialize compress field with the provided compress argument
         }
     }
 }
@@ -263,7 +192,7 @@ impl Rotate for SizeRotate {
     // renaming it, and recursively calling `get_file` to get a new file.
     fn get_file(&mut self, data: &Vec<u8>) -> io::Result<&mut File> {
         if self.file.get_mut().is_none() {
-            let (fp, exists) = Self::open_file(self.path.as_str())?;
+            let (fp, exists) = self.open_file(self.path.as_str())?;
             self.file.replace(Some(fp));
             if let Some(meta) = exists {
                 self.cur_size = meta.len();
@@ -282,14 +211,14 @@ impl Rotate for SizeRotate {
             println!("Failed to flush the file: {:+?}", err);
         }
         drop(fp);
-        let new_filename = Self::rotate_filename(&self.path, self.compress, true);
+        let new_filename = self.rotate_filename(&self.path, self.compress, true);
         println!("Move file: {:?} -> {:?}", self.path, new_filename);
         if let Err(err) = fs::rename(self.path.clone(), &new_filename) {
             println!("Failed to move the file: {:+?}", err)
         } else {
-          if self.compress {
-            Self::gzip_encode(&new_filename)?;
-          }
+            if self.compress {
+                self.gzip_encode(&new_filename)?;
+            }
         }
         self.get_file(data)
     }
@@ -297,7 +226,8 @@ impl Rotate for SizeRotate {
     // Flushes the file to disk.
     #[inline]
     fn flush(&mut self) {
-        Self::file_flush(self.file.get_mut());
+        let fp = self.file.borrow_mut();
+        self.file_flush(&fp);
     }
 
     // Closes the file by flushing it and dropping the file handle.
@@ -319,7 +249,7 @@ struct DailyRotate {
 
 impl DailyRotate {
     // Constructs a new instance of DailyRotate
-    fn new(path: String, receiver: Receiver<Vec<u8>>, compress:bool) -> Self {
+    fn new(path: String, receiver: Receiver<Vec<u8>>, compress: bool) -> Self {
         Self {
             path,                      // Assigns the given path to the path field
             receiver,                  // Assigns the given receiver to the receiver field
@@ -342,9 +272,9 @@ impl Rotate for DailyRotate {
     // If the current day is different from the create_day, it rotates the file by flushing, renaming, and opening a new file
     // Returns a mutable reference to the file
     fn get_file(&mut self, data: &Vec<u8>) -> io::Result<&mut File> {
-        let day = Self::day(); // Get the current day
+        let day = self.day(); // Get the current day
         if self.file.get_mut().is_none() {
-            let (fp, exists) = Self::open_file(self.path.as_str())?; // Open the file
+            let (fp, exists) = self.open_file(self.path.as_str())?; // Open the file
             self.file.replace(Some(fp)); // Replace the file with the opened file
             if let Some(meta) = exists {
                 let datetime: DateTime<Local> = DateTime::from(meta.created()?);
@@ -364,14 +294,14 @@ impl Rotate for DailyRotate {
         }
         drop(fp);
 
-        let new_filename = Self::rotate_filename(&self.path, self.compress, false);
+        let new_filename = self.rotate_filename(&self.path, self.compress, false);
         println!("Move file: {:} -> {:}", self.path, new_filename);
         if let Err(err) = fs::rename(self.path.clone(), &new_filename) {
             println!("Failed to move the file: {:+?}", err);
         } else {
-          if self.compress {
-            Self::gzip_encode(&new_filename)?;
-          }
+            if self.compress {
+                self.gzip_encode(&new_filename)?;
+            }
         }
         self.get_file(data)
     }
@@ -379,7 +309,8 @@ impl Rotate for DailyRotate {
     // Flushes the current file
     #[inline]
     fn flush(&mut self) {
-        Self::file_flush(self.file.get_mut());
+        let fp = self.file.borrow_mut();
+        self.file_flush(&fp);
     }
 
     // Closes the file by flushing it and dropping the file handle
@@ -387,5 +318,81 @@ impl Rotate for DailyRotate {
     fn close(&mut self) {
         self.flush();
         drop(self.file.take());
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Output {
+    sender: SyncSender<Vec<u8>>, // Sender for sending log data
+    flushing: Arc<AtomicBool>,   // Atomic boolean flag for indicating if a flush is requested
+}
+
+impl Output {
+    /// Creates a new `Output` instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - An optional path for the log files.
+    /// * `mode` - The `CutMode` for cutting log files.
+    /// * `file_size` - An optional maximum size for log files.
+    /// * `running` - An `Arc<AtomicBool>` indicating if the logger is running.
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple containing the `Output` instance and a `JoinHandle<()>`.
+    pub fn new(
+        path: Option<String>,
+        mode: CutMode,
+        file_size: Option<u64>,
+        compress: bool,
+        running: Arc<AtomicBool>,
+        interval: u64,
+    ) -> (Self, JoinHandle<()>) {
+        let log_path = match path {
+            Some(s) => s,
+            None => String::from("output"),
+        };
+        let (sender, receiver) = sync_channel(64);
+        let flushing = Arc::new(AtomicBool::new(false));
+        let fsh = flushing.clone();
+        let jh = thread::spawn(move || match mode {
+            CutMode::Size => SizeRotate::new(log_path, receiver, file_size, compress)
+                .timed(running, fsh, interval),
+            CutMode::Daily => {
+                DailyRotate::new(log_path, receiver, compress).timed(running, fsh, interval)
+            }
+        });
+
+        let output = Self { sender, flushing };
+
+        (output, jh)
+    }
+}
+
+impl Write for Output {
+    /// Writes the provided buffer to the log sender.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - A slice representing the buffer to be written.
+    ///
+    /// # Returns
+    ///
+    /// Returns an `io::Result` indicating the success of the write operation.
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Err(err) = self.sender.send(buf.to_vec()) {
+            return Err(Error::new(ErrorKind::Other, err));
+        }
+        Ok(buf.len())
+    }
+
+    /// Flushes the log sender by setting the flushing flag to true.
+    ///
+    /// # Returns
+    ///
+    /// Returns an `io::Result` indicating the success of the flush operation.
+    fn flush(&mut self) -> io::Result<()> {
+        self.flushing.store(true, Ordering::SeqCst);
+        Ok(())
     }
 }

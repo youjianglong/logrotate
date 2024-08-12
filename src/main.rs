@@ -14,28 +14,68 @@ use toml::Table;
 
 #[derive(Parser, Debug, Clone)]
 #[command(version)]
-#[command(author="XiaoYao<you.jianglong@gmail.com>")]
+#[command(author = "XiaoYao<you.jianglong@gmail.com>")]
 #[command(about = "Log Rolling and Cutting Tool")]
 struct Args {
-    #[arg(short, long, env="LOG_ROTATE_CONFIG", help = "Specifies the configuration file")]
+    #[arg(
+        short,
+        long,
+        env = "LOG_ROTATE_CONFIG",
+        help = "Specifies the configuration file"
+    )]
     config: Option<String>,
 
-    #[arg(short, long, env="LOG_ROTATE_OUTPUT", help = "Specifies the output file")]
+    #[arg(
+        short,
+        long,
+        env = "LOG_ROTATE_OUTPUT",
+        help = "Specifies the output file"
+    )]
     output: Option<String>,
 
-    #[arg(long, short = 'm', env="LOG_ROTATE_CUT_MODE" , default_value = "size", help = "Specifies the cut mode")]
+    #[arg(
+        long,
+        short = 'm',
+        env = "LOG_ROTATE_CUT_MODE",
+        default_value = "size",
+        help = "Specifies the cut mode"
+    )]
     cut_mode: output::CutMode,
 
-    #[arg(long, short, env="LOG_ROTATE_RESERVED", default_value = "0", help = "Specifies the reserved value")]
+    #[arg(
+        long,
+        short,
+        env = "LOG_ROTATE_RESERVED",
+        default_value = "0",
+        help = "Specifies the reserved value"
+    )]
     reserved: i32,
 
-    #[arg(long, short = 's', env="LOG_ROTATE_FILE_SIZE", default_value="16777216", help = "Specifies the file size")]
+    #[arg(
+        long,
+        short = 's',
+        env = "LOG_ROTATE_FILE_SIZE",
+        default_value = "16777216",
+        help = "Specifies the file size"
+    )]
     file_size: Option<u64>,
 
-    #[arg(long, short = 'z', env="LOG_ROTATE_COMPRESS", default_value="false", help = "Specifies the compression level")]
+    #[arg(
+        long,
+        short = 'z',
+        env = "LOG_ROTATE_COMPRESS",
+        default_value = "false",
+        help = "Specifies the compression level"
+    )]
     compress: bool,
 
-    #[arg(long, short = 'i', env="LOG_ROTATE_FLUSH", default_value="5", help = "Specifies the flush interval")]
+    #[arg(
+        long,
+        short = 'i',
+        env = "LOG_ROTATE_FLUSH",
+        default_value = "5",
+        help = "Specifies the flush interval"
+    )]
     flush_interval: u64,
 }
 
@@ -55,38 +95,51 @@ fn main() {
     let running = Arc::new(AtomicBool::new(true)); // Create a shared atomic boolean variable for termination signal
     signal(running.clone()); // Register a signal handler for termination signal
 
-    if let Some(ref config_file) = args.config { // If a configuration file is specified, read and parse it
-      let mut file = File::open(config_file.as_str()).expect("Open config file failed");
-      let mut buf = String::new();
-      let size=file.read_to_string(&mut buf).expect("Read config file failed");
-      if size==0 {
-        println!("Config file is empty");
-        exit(1)
-      }
-      let table:Table = toml::from_str(buf.as_str()).expect("Parse config file failed");
-      if let Some(val) = table.get("output") {
-        args.output = Some(val.as_str().expect("\"output\" must be string").to_string());
-      }
-      if let Some(val) = table.get("cut_mode") {
-        args.cut_mode = output::CutMode::from_str(val.as_str().expect("\"cut_mode\" must be string"), true).expect("cut_mode must be valid");
-      }
-      if let Some(val) = table.get("reserved") {
-        args.reserved = val.as_integer().expect("\"reserved\" must be integer") as i32;
-      }
-      if let Some(val) = table.get("file_size") {
-        args.file_size = Some(val.as_integer().expect("\"file_size\" must be integer") as u64);
-      }
-      if let Some(val) = table.get("compress") {
-        args.compress = val.as_bool().expect("\"compress\" must be bool");
-      }
-      if let Some(val) = table.get("flush_interval") {
-        args.flush_interval = val.as_integer().expect("\"flush_interval\" must be integer") as u64;
-      }
+    if let Some(ref config_file) = args.config {
+        // If a configuration file is specified, read and parse it
+        let mut file = File::open(config_file.as_str()).expect("Open config file failed");
+        let mut buf = String::new();
+        let size = file
+            .read_to_string(&mut buf)
+            .expect("Read config file failed");
+        if size == 0 {
+            println!("Config file is empty");
+            exit(1)
+        }
+        let table: Table = toml::from_str(buf.as_str()).expect("Parse config file failed");
+        if let Some(val) = table.get("output") {
+            args.output = Some(val.as_str().expect("\"output\" must be string").to_string());
+        }
+        if let Some(val) = table.get("cut_mode") {
+            args.cut_mode =
+                output::CutMode::from_str(val.as_str().expect("\"cut_mode\" must be string"), true)
+                    .expect("cut_mode must be valid");
+        }
+        if let Some(val) = table.get("reserved") {
+            args.reserved = val.as_integer().expect("\"reserved\" must be integer") as i32;
+        }
+        if let Some(val) = table.get("file_size") {
+            args.file_size = Some(val.as_integer().expect("\"file_size\" must be integer") as u64);
+        }
+        if let Some(val) = table.get("compress") {
+            args.compress = val.as_bool().expect("\"compress\" must be bool");
+        }
+        if let Some(val) = table.get("flush_interval") {
+            args.flush_interval =
+                val.as_integer()
+                    .expect("\"flush_interval\" must be integer") as u64;
+        }
     }
 
     // Create an output writer and a join handle for the output thread
-    let (mut writer, jh) =
-        output::Output::new(args.output, args.cut_mode, args.file_size, args.compress, running.clone(), args.flush_interval);
+    let (mut writer, jh) = output::Output::new(
+        args.output,
+        args.cut_mode,
+        args.file_size,
+        args.compress,
+        running.clone(),
+        args.flush_interval,
+    );
 
     let mut stdin = io::stdin(); // Create a handle for standard input
     let mut buf = [0u8; 1024]; // Create a buffer to read input
