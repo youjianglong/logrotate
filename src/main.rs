@@ -1,14 +1,19 @@
-mod output;
-
 extern crate clap;
+
+#[macro_use]
+mod utils;
+mod rotate;
 
 use clap::{Parser, ValueEnum};
 use std::fs::File;
-use std::io;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read};
 use std::process::exit;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use tokio::io::{stdin, AsyncReadExt};
+use tokio::signal::ctrl_c;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use tokio::time::{sleep, Duration};
+use tokio::{join, select};
 use toml;
 use toml::Table;
 
@@ -40,7 +45,7 @@ struct Args {
         default_value = "size",
         help = "Specifies the cut mode"
     )]
-    cut_mode: output::CutMode,
+    cut_mode: rotate::CutMode,
 
     #[arg(
         long,
@@ -68,33 +73,32 @@ struct Args {
         help = "Specifies the compression level"
     )]
     compress: bool,
-
-    #[arg(
-        long,
-        short = 'i',
-        env = "LOG_ROTATE_FLUSH",
-        default_value = "5",
-        help = "Specifies the flush interval"
-    )]
-    flush_interval: u64,
 }
 
 // This function sets up a signal handler for the interrupt signal (Ctrl+C)
 // The `running` parameter is an `Arc<AtomicBool>` which allows thread-safe access to the `running` variable
-fn signal(running: Arc<AtomicBool>) {
-    // Set the interrupt signal handler using the `ctrlc::set_handler` function
-    // The closure passed to the `set_handler` function will be called when the interrupt signal is received
-    // The closure sets the value of the `running` variable to `false` using the `store` method of the `AtomicBool` struct
-    // The `Ordering::SeqCst` argument specifies the memory ordering used by the `store` method
-    ctrlc::set_handler(move || running.store(false, Ordering::SeqCst)).unwrap();
+async fn signal(ch: broadcast::Sender<bool>) {
+    let mut cr = ch.subscribe();
+    select! {
+      s = ctrl_c() => {
+        // The `ctrl_c()` function returns a future that resolves when the interrupt signal is received
+        match s {
+            Ok(()) => {
+                log!("interrupted");
+                sleep(Duration::from_millis(500)).await;
+                ch.send(true).expect("broadcast send error");
+            }
+            Err(err) => {
+                log!("signal error: {}", err);
+            }
+        }
+      },
+      _ = cr.recv() => {}
+    }
 }
 
-fn main() {
+fn parse_args() -> Args {
     let mut args: Args = Args::parse(); // Parse command-line arguments
-
-    let running = Arc::new(AtomicBool::new(true)); // Create a shared atomic boolean variable for termination signal
-    signal(running.clone()); // Register a signal handler for termination signal
-
     if let Some(ref config_file) = args.config {
         // If a configuration file is specified, read and parse it
         let mut file = File::open(config_file.as_str()).expect("Open config file failed");
@@ -103,7 +107,7 @@ fn main() {
             .read_to_string(&mut buf)
             .expect("Read config file failed");
         if size == 0 {
-            println!("Config file is empty");
+            log!("Config file is empty");
             exit(1)
         }
         let table: Table = toml::from_str(buf.as_str()).expect("Parse config file failed");
@@ -112,7 +116,7 @@ fn main() {
         }
         if let Some(val) = table.get("cut_mode") {
             args.cut_mode =
-                output::CutMode::from_str(val.as_str().expect("\"cut_mode\" must be string"), true)
+                rotate::CutMode::from_str(val.as_str().expect("\"cut_mode\" must be string"), true)
                     .expect("cut_mode must be valid");
         }
         if let Some(val) = table.get("reserved") {
@@ -124,56 +128,72 @@ fn main() {
         if let Some(val) = table.get("compress") {
             args.compress = val.as_bool().expect("\"compress\" must be bool");
         }
-        if let Some(val) = table.get("flush_interval") {
-            args.flush_interval =
-                val.as_integer()
-                    .expect("\"flush_interval\" must be integer") as u64;
+    }
+    args
+}
+
+async fn stdin_read(sender: mpsc::Sender<Vec<u8>>, ch: broadcast::Sender<bool>) {
+    let mut stdin = stdin(); // Create a handle to the standard input
+    let mut cr = ch.subscribe();
+    loop {
+        let mut buf = Vec::new(); // Create a buffer to read input
+        select! {
+          res = stdin.read_buf(&mut buf) => {
+            if buf.len() > 0 {
+                if let Err(err) = sender.send(buf).await {
+                    // Write the input to the output file
+                    log!("write failed: {:+?}", err); // Print an error message if the write operation fails
+                }
+            }
+            match res {
+                Ok(len) => {
+                    // If input was successfully read
+                    if len < 1 {
+                        // If the length of the input is less than 1, it means that the input has been closed
+                        log!("stdin closed");
+                        break;
+                    }
+                }
+                Err(err) => match err.kind() {
+                    // If an error occurred while reading input
+                    ErrorKind::UnexpectedEof => {
+                        // If the error is an unexpected end-of-file
+                        log!("stdin closed");
+                        break;
+                    }
+                    _ => {
+                        log!("read failed: {:+?}", err);
+                        break;
+                    }
+                },
+            }
+          },
+          _ = cr.recv() => {
+            break;
+          }
         }
     }
+    log!("finish stdin read!");
+}
 
-    // Create an output writer and a join handle for the output thread
-    let (mut writer, jh) = output::Output::new(
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let args = parse_args();
+    let (sender, receiver) = mpsc::channel::<Vec<u8>>(64);
+    let (ch, _) = broadcast::channel(3);
+
+    let mut rotation = rotate::new(
         args.output,
         args.cut_mode,
         args.file_size,
         args.compress,
-        running.clone(),
-        args.flush_interval,
+        receiver,
     );
 
-    let mut stdin = io::stdin(); // Create a handle for standard input
-    let mut buf = [0u8; 1024]; // Create a buffer to read input
-
-    while running.load(Ordering::SeqCst) {
-        // Loop until termination signal is received
-        let res = stdin.read(&mut buf); // Read input from standard input into the buffer
-        match res {
-            Ok(len) => {
-                // If input was successfully read
-                if len < 1 {
-                    // If the length of the input is less than 1, continue to the next iteration
-                    continue;
-                }
-                if let Err(err) = writer.write(&(buf[0..len])) {
-                    // Write the input to the output file
-                    println!("Write failed: {:+?}", err); // Print an error message if the write operation fails
-                    continue; // Continue to the next iteration
-                }
-            }
-            Err(err) => match err.kind() {
-                // If an error occurred while reading input
-                ErrorKind::UnexpectedEof => {
-                    // If the error is an unexpected end-of-file
-                    println!("Stdin closed");
-                    break;
-                }
-                _ => {
-                    println!("Read failed: {:+?}", err)
-                }
-            },
-        }
-    }
-
-    println!("Shutting down ...");
-    jh.join().unwrap(); // Wait for the output thread to finish and unwrap any errors
+    join!(
+        rotate::start(&mut rotation, ch.clone()),
+        stdin_read(sender, ch.clone()),
+        signal(ch.clone())
+    );
+    exit(0);
 }

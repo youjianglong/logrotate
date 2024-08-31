@@ -1,6 +1,6 @@
 [package]
 name = "logrotate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["XiaoYao<you.jianglong@gmail.com>"]
 
@@ -8,7 +8,8 @@ authors = ["XiaoYao<you.jianglong@gmail.com>"]
 
 [dependencies]
 chrono = "0.4.26"
-clap = { version="4.4.0", features=["derive", "env"] }
-ctrlc = { version="3.4.0", features=["termination"] }
+clap = { version = "4.4.0", features = ["derive", "env"] }
+libc = "0.2.158"
 libflate = "2"
-toml = { version="0.8.15", default-features = false, features = ["parse"] }
+tokio = { version = "1.40.0", features = ["full"] }
+toml = { version = "0.8.15", default-features = false, features = ["parse"] }
