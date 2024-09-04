@@ -9,6 +9,8 @@ use std::io::{copy, ErrorKind, Write};
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
+use crate::utils;
+
 #[derive(Clone, Debug, ValueEnum)]
 pub(crate) enum CutMode {
     Size,  // Represents the mode for cutting logs based on size
@@ -297,27 +299,68 @@ pub fn new(
     }
 }
 
-pub async fn start(rotate: &mut Box<dyn Rotate + Send>, ch: broadcast::Sender<bool>) {
+fn write_all(rotate: &mut Box<dyn Rotate + Send>, data: &[u8]) {
+    match rotate.get_file(data.len() as u64) {
+        Ok(fp) => {
+            if let Err(err) = fp.write_all(data) {
+                log!("failed to write content to file: {:+?}", err);
+            }
+        }
+        Err(err) => {
+            log!("failed to open file: {:+?}", err);
+        }
+    }
+}
+
+pub async fn start(
+    output: Option<String>,
+    cut_mode: CutMode,
+    file_size: Option<u64>,
+    compress: bool,
+    receiver: mpsc::Receiver<Vec<u8>>,
+    ch: broadcast::Sender<()>,
+) {
+    let mut rotate = new(output, cut_mode, file_size, compress, receiver);
+    let mut tail = None;
     loop {
         match rotate.receiver().recv().await {
-            Some(data) => data.split(|&x| x == b'\n').for_each(|line| {
-                match rotate.get_file(line.len() as u64) {
-                    Ok(fp) => {
-                        if let Err(err) = fp.write_all(line) {
-                            log!("failed to write content to file: {:+?}", err);
-                        }
-                    }
-                    Err(err) => {
-                        log!("failed to open file: {:+?}", err);
+            Some(mut data) => {
+                let last_tail = tail.take();
+                if data[data.len() - 1] != b'\n' {
+                    if let Some(index) = data.iter().rposition(|&x| x == b'\n') {
+                        tail = Some(data[index + 1..].to_vec());
+                        data.truncate(index + 1);
                     }
                 }
-            }),
+                let mut lines = utils::Lines::new(data.as_slice());
+                if last_tail.is_some() {
+                    if let Some(i) = lines.next() {
+                        let mut line = last_tail.unwrap();
+                        line.append(&mut i.to_vec());
+                        write_all(&mut rotate, line.as_slice());
+                    } else {
+                        if tail.is_some() {
+                            let mut t1 = last_tail.unwrap();
+                            let mut t2 = tail.unwrap();
+                            t1.append(&mut t2);
+                            tail = Some(t1);
+                        }
+                        continue;
+                    }
+                }
+                lines.for_each(|line| {
+                    write_all(&mut rotate, line);
+                });
+            }
             None => {
                 break;
             }
         }
     }
+    if let Some(t) = tail {
+        write_all(&mut rotate, &t);
+    }
     rotate.close();
     log!("closed rotation!");
-    let _ = ch.send(true);
+    let _ = ch.send(());
 }

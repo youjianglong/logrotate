@@ -2,6 +2,7 @@ extern crate clap;
 
 #[macro_use]
 mod utils;
+mod pm;
 mod rotate;
 
 use clap::{Parser, ValueEnum};
@@ -73,11 +74,17 @@ struct Args {
         help = "Specifies the compression level"
     )]
     compress: bool,
+
+    #[clap(
+        value_name = "ARGS",
+        help = "Arguments to pass to the target process, first is the command, others are arguments, like: `ls -l -a`"
+    )]
+    args: Vec<String>,
 }
 
 // This function sets up a signal handler for the interrupt signal (Ctrl+C)
 // The `running` parameter is an `Arc<AtomicBool>` which allows thread-safe access to the `running` variable
-async fn signal(ch: broadcast::Sender<bool>) {
+async fn signal(ch: broadcast::Sender<()>) {
     let mut cr = ch.subscribe();
     select! {
       s = ctrl_c() => {
@@ -86,7 +93,7 @@ async fn signal(ch: broadcast::Sender<bool>) {
             Ok(()) => {
                 log!("interrupted");
                 sleep(Duration::from_millis(500)).await;
-                ch.send(true).expect("broadcast send error");
+                ch.send(()).expect("broadcast send error");
             }
             Err(err) => {
                 log!("signal error: {}", err);
@@ -128,11 +135,23 @@ fn parse_args() -> Args {
         if let Some(val) = table.get("compress") {
             args.compress = val.as_bool().expect("\"compress\" must be bool");
         }
+        if let Some(val) = table.get("exec") {
+            args.args = val
+                .as_array()
+                .expect("\"exec\" must be array of string")
+                .iter()
+                .map(|x| {
+                    x.as_str()
+                        .expect("\"exec\" must be array of string")
+                        .to_string()
+                })
+                .collect();
+        }
     }
     args
 }
 
-async fn stdin_read(sender: mpsc::Sender<Vec<u8>>, ch: broadcast::Sender<bool>) {
+async fn stdin_read(sender: mpsc::Sender<Vec<u8>>, ch: broadcast::Sender<()>) {
     let mut stdin = stdin(); // Create a handle to the standard input
     let mut cr = ch.subscribe();
     loop {
@@ -146,10 +165,8 @@ async fn stdin_read(sender: mpsc::Sender<Vec<u8>>, ch: broadcast::Sender<bool>) 
                 }
             }
             match res {
-                Ok(len) => {
-                    // If input was successfully read
-                    if len < 1 {
-                        // If the length of the input is less than 1, it means that the input has been closed
+                Ok(len) => { // If input was successfully read
+                    if len < 1 { // If the length of the input is less than 1, it means that the input has been closed
                         log!("stdin closed");
                         break;
                     }
@@ -182,18 +199,26 @@ async fn main() {
     let (sender, receiver) = mpsc::channel::<Vec<u8>>(64);
     let (ch, _) = broadcast::channel(3);
 
-    let mut rotation = rotate::new(
-        args.output,
-        args.cut_mode,
-        args.file_size,
-        args.compress,
-        receiver,
-    );
+    let src_handle = async {
+        if args.args.len() > 0 {
+            pm::spawn(args.args, sender, ch.clone()).await;
+        } else {
+            stdin_read(sender, ch.clone()).await;
+        };
+    };
 
     join!(
-        rotate::start(&mut rotation, ch.clone()),
-        stdin_read(sender, ch.clone()),
+        rotate::start(
+            args.output,
+            args.cut_mode,
+            args.file_size,
+            args.compress,
+            receiver,
+            ch.clone()
+        ),
+        src_handle,
         signal(ch.clone())
     );
+    drop(ch);
     exit(0);
 }
