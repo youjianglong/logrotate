@@ -5,16 +5,30 @@ pub fn trim_file_src(mut src: &str) -> &str {
     src
 }
 
+pub static mut DEBUG: bool = false;
+
+pub fn set_debug(debug: bool) {
+    unsafe {
+        DEBUG = debug;
+    }
+}
+
 #[macro_export]
 macro_rules! log {
     ($fmt:expr, $($arg:tt)*) => {
-      println!("[{}:{}] - {}", crate::utils::trim_file_src(file!()), line!(), format!($fmt, $($arg)*))
+      if unsafe {crate::utils::DEBUG} {
+        println!("[{}:{}] - {}", crate::utils::trim_file_src(file!()), line!(), format!($fmt, $($arg)*))
+      }
     };
     ($fmt:expr) => {
-      println!("[{}:{}] - {}", crate::utils::trim_file_src(file!()), line!(), $fmt)
+      if unsafe {crate::utils::DEBUG} {
+        println!("[{}:{}] - {}", crate::utils::trim_file_src(file!()), line!(), $fmt)
+      }
     };
     () => {
-      println!("[{}:{}] -", crate::utils::trim_file_src(file!()), line!())
+      if unsafe {crate::utils::DEBUG} {
+        println!("[{}:{}] -", crate::utils::trim_file_src(file!()), line!())
+      }
     }
 }
 

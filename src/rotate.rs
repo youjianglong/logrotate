@@ -5,7 +5,9 @@ use libflate::gzip::Encoder;
 use std::cell::RefCell;
 use std::fs;
 use std::io;
+use std::io::Error;
 use std::io::{copy, ErrorKind, Write};
+use std::path;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
@@ -24,9 +26,58 @@ fn day() -> String {
     Local::now().format(DATE_FMT).to_string()
 }
 
+fn date_add(days: i64) -> String {
+    let dt: DateTime<Local> = Local::now();
+    let new_dt = dt + chrono::Duration::days(days);
+    new_dt.format(DATE_FMT).to_string()
+}
+
 // Checks if a file exists at the given path
 fn is_file(path: &String) -> bool {
     return fs::metadata(path).is_ok_and(|meta| meta.is_file());
+}
+
+fn file_glob(file_path: &String) -> io::Result<Vec<String>> {
+    let p = path::Path::new(&file_path);
+    let dir_path = p.parent();
+    let base_path = p.file_name();
+    if dir_path.is_none() {
+        return Err(Error::new(ErrorKind::Other, "invalid file path"));
+    }
+    if base_path.is_none() {
+        return Err(Error::new(ErrorKind::Other, "invalid file name"));
+    }
+    let dir = dir_path.unwrap();
+    if !dir.exists() {
+        return Err(Error::new(ErrorKind::NotFound, "directory does not exist"));
+    }
+    let bp = base_path.unwrap().to_str();
+    if bp.is_none() {
+        return Err(Error::new(ErrorKind::Other, "invalid base directory"));
+    }
+    let base_path: String = bp.unwrap().to_string();
+    let mut files = vec![];
+    for e in dir.read_dir()? {
+        let de = e?;
+        if let Ok(file_name) = de.file_name().into_string() {
+            if file_name.starts_with(&base_path) {
+                if let Some(s) = dir.join(&file_name).as_os_str().to_str() {
+                    files.push(s.to_string());
+                } else {
+                    return Err(Error::new(
+                        ErrorKind::Other,
+                        format!("invalid file name: {}", &file_name),
+                    ));
+                }
+            }
+        } else {
+            return Err(Error::new(
+                ErrorKind::Other,
+                format!("invalid file name: {:?}", de.file_name()),
+            ));
+        }
+    }
+    return Ok(files);
 }
 
 // Opens a file at the given path and returns a tuple containing the file handle and its metadata
@@ -69,12 +120,34 @@ fn gzip_encode(filename: &String) -> io::Result<()> {
     Ok(())
 }
 
+fn remove_log_files(file_path: &String, day: &String) {
+    let file_path = format!("{}.{}", file_path, day);
+    match file_glob(&file_path) {
+        Ok(files) => {
+            for file in files {
+                match fs::remove_file(&file) {
+                    Ok(_) => {
+                        log!("removed file \"{}\"", &file);
+                    }
+                    Err(err) => {
+                        log!("failed to remove file \"{}\": {:+?}", &file, err);
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            log!("failed to list log files: {:+?}", err);
+        }
+    }
+}
+
 pub trait Rotate {
     // Rotates the filename by appending the current day to it
     // If the rotated filename already exists, it appends a unique identifier to it
     fn rotate_filename(&self, path: &String, compress: bool, mul: bool) -> String {
         let day = day();
         if !mul {
+            // If no multi mode, check if the file exists
             let filename = path.clone() + "." + day.as_str();
             if (compress && !is_file(&format!("{}.gz", filename)))
                 || (!compress && !is_file(&filename))
@@ -82,9 +155,10 @@ pub trait Rotate {
                 return filename;
             }
         }
+
         let mut i = 1;
         loop {
-            let filename = format!("{:}.{:}.{:}", path, day, i);
+            let filename = format!("{:}.{:}-{:}", path, day, i);
             if (compress && !is_file(&format!("{}.gz", filename)))
                 || (!compress && !is_file(&filename))
             {
@@ -108,6 +182,7 @@ struct SizeRotate {
     cur_size: u64,                     // The current size of the file
     file: RefCell<Option<File>>,       // The file being written (wrapped in a RefCell)
     compress: bool,                    // Whether to compress the file
+    keep_days: i64,                    // The number of days to keep the log files
 }
 
 impl SizeRotate {
@@ -116,16 +191,18 @@ impl SizeRotate {
         receiver: mpsc::Receiver<Vec<u8>>,
         file_size: Option<u64>,
         compress: bool,
+        keep_days: i64,
     ) -> Self {
         let slo = file_size.or_else(|| Some(1024 * 1024 * 20)); // If file_size is None, set it to 20MB (default)
 
         Self {
-            path,                     // Initialize path field with provided path argument
-            receiver,                 // Initialize receiver field with provided receiver argument
-            size_limit: slo.unwrap(), // Initialize size_limit field with the value of slo
-            cur_size: 0,              // Initialize cur_size field with 0
-            file: RefCell::default(), // Initialize file field with a default value
-            compress, // Initialize compress field with the provided compress argument
+            path,
+            receiver,
+            size_limit: slo.unwrap(),
+            cur_size: 0,
+            file: RefCell::default(),
+            compress,
+            keep_days,
         }
     }
 }
@@ -150,6 +227,7 @@ impl Rotate for SizeRotate {
             }
         }
         if self.cur_size + len <= self.size_limit {
+            // Check if the current size plus the new length is less than or equal to the size limit
             self.cur_size += len;
             return Ok(self.file.get_mut().as_mut().unwrap());
         }
@@ -170,6 +248,11 @@ impl Rotate for SizeRotate {
                 gzip_encode(&new_filename)?;
             }
         }
+
+        // drop the expired file
+        let expire_day = date_add(-self.keep_days);
+        remove_log_files(&self.path, &expire_day);
+
         self.get_file(len)
     }
 
@@ -195,19 +278,26 @@ struct DailyRotate {
     path: String,                      // The path where the rotated files will be stored
     receiver: mpsc::Receiver<Vec<u8>>, // The receiver end of a channel that receives byte vectors
     file: RefCell<Option<File>>,       // A mutable reference to an optional file
-    create_day: String,                // The day when the file was created
     compress: bool,                    // Whether to compress the rotated files
+    keep_days: i64,                    // The number of days to keep rotated files
+    create_day: String,                // The day when the file was created
 }
 
 impl DailyRotate {
     // Constructs a new instance of DailyRotate
-    fn new(path: String, receiver: mpsc::Receiver<Vec<u8>>, compress: bool) -> Self {
+    fn new(
+        path: String,
+        receiver: mpsc::Receiver<Vec<u8>>,
+        compress: bool,
+        keep_days: i64,
+    ) -> Self {
         Self {
-            path,                      // Assigns the given path to the path field
-            receiver,                  // Assigns the given receiver to the receiver field
-            file: RefCell::default(),  // Initializes the file field as an empty option
-            create_day: String::new(), // Initializes the create_day field as an empty string
-            compress,                  // Assigns the given compress flag to the compress field
+            path,
+            receiver,
+            file: RefCell::default(),
+            compress,
+            keep_days,
+            create_day: String::new(),
         }
     }
 }
@@ -229,8 +319,8 @@ impl Rotate for DailyRotate {
             let (fp, exists) = open_file(self.path.as_str())?; // Open the file
             self.file.replace(Some(fp)); // Replace the file with the opened file
             if let Some(meta) = exists {
-                let datetime: DateTime<Local> = DateTime::from(meta.created()?);
-                self.create_day = datetime.format(DATE_FMT).to_string(); // Set the create_day field based on the file creation time
+                let date_time: DateTime<Local> = DateTime::from(meta.modified()?);
+                self.create_day = date_time.format(DATE_FMT).to_string(); // Set the create_day field based on the file creation time
             } else {
                 self.create_day = day.clone(); // Set the create_day field to the current day
             }
@@ -256,6 +346,9 @@ impl Rotate for DailyRotate {
                 gzip_encode(&new_filename)?;
             }
         }
+        // drop the expired file
+        let expire_day = date_add(-self.keep_days);
+        remove_log_files(&self.path, &expire_day);
         self.get_file(len)
     }
 
@@ -277,23 +370,31 @@ impl Rotate for DailyRotate {
 unsafe impl Send for DailyRotate {}
 
 pub fn new(
-    path: Option<String>,
+    file_path: Option<String>,
     mode: CutMode,
     file_size: Option<u64>,
     compress: bool,
+    keep_days: i64,
     receiver: mpsc::Receiver<Vec<u8>>,
 ) -> Box<dyn Rotate + Send> {
-    let log_path = match path {
+    let log_path = match file_path {
         Some(s) => s,
-        None => String::from("output"),
+        None => String::from("logs/out"),
     };
+    if let Some(log_dir) = path::Path::new(&log_path).parent() {
+        if !log_dir.exists() {
+            if let Err(err) = fs::create_dir_all(log_dir) {
+                panic!("failed to create log directory: {:+?}", err)
+            }
+        }
+    }
     match mode {
         CutMode::Size => {
-            let r = SizeRotate::new(log_path, receiver, file_size, compress);
+            let r = SizeRotate::new(log_path, receiver, file_size, compress, keep_days);
             Box::new(r)
         }
         CutMode::Daily => {
-            let r = DailyRotate::new(log_path, receiver, compress);
+            let r = DailyRotate::new(log_path, receiver, compress, keep_days);
             Box::new(r)
         }
     }
@@ -313,14 +414,17 @@ fn write_all(rotate: &mut Box<dyn Rotate + Send>, data: &[u8]) {
 }
 
 pub async fn start(
-    output: Option<String>,
+    file_path: Option<String>,
     cut_mode: CutMode,
     file_size: Option<u64>,
     compress: bool,
+    keep_days: i64,
     receiver: mpsc::Receiver<Vec<u8>>,
     ch: broadcast::Sender<()>,
 ) {
-    let mut rotate = new(output, cut_mode, file_size, compress, receiver);
+    let mut rotate = new(
+        file_path, cut_mode, file_size, compress, keep_days, receiver,
+    );
     let mut tail = None;
     loop {
         match rotate.receiver().recv().await {

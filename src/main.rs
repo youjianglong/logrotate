@@ -51,11 +51,11 @@ struct Args {
     #[arg(
         long,
         short,
-        env = "LOG_ROTATE_RESERVED",
+        env = "LOG_KEEP_DAYS",
         default_value = "0",
-        help = "Specifies the reserved value"
+        help = "Specifies the log retention period"
     )]
-    reserved: i32,
+    keep_days: i64,
 
     #[arg(
         long,
@@ -74,6 +74,14 @@ struct Args {
         help = "Specifies the compression level"
     )]
     compress: bool,
+
+    #[arg(
+        long,
+        env = "LOG_ROTATE_DEBUG",
+        default_value = "false",
+        help = "Specifies the debug switch"
+    )]
+    debug: bool,
 
     #[clap(
         value_name = "ARGS",
@@ -126,14 +134,17 @@ fn parse_args() -> Args {
                 rotate::CutMode::from_str(val.as_str().expect("\"cut_mode\" must be string"), true)
                     .expect("cut_mode must be valid");
         }
-        if let Some(val) = table.get("reserved") {
-            args.reserved = val.as_integer().expect("\"reserved\" must be integer") as i32;
+        if let Some(val) = table.get("keep_num") {
+            args.keep_days = val.as_integer().expect("\"keep_num\" must be integer");
         }
         if let Some(val) = table.get("file_size") {
             args.file_size = Some(val.as_integer().expect("\"file_size\" must be integer") as u64);
         }
         if let Some(val) = table.get("compress") {
             args.compress = val.as_bool().expect("\"compress\" must be bool");
+        }
+        if let Some(val) = table.get("debug") {
+            args.debug = val.as_bool().expect("\"debug\" must be bool");
         }
         if let Some(val) = table.get("exec") {
             args.args = val
@@ -196,6 +207,9 @@ async fn stdin_read(sender: mpsc::Sender<Vec<u8>>, ch: broadcast::Sender<()>) {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args = parse_args();
+
+    utils::set_debug(args.debug);
+
     let (sender, receiver) = mpsc::channel::<Vec<u8>>(64);
     let (ch, _) = broadcast::channel(3);
 
@@ -213,6 +227,7 @@ async fn main() {
             args.cut_mode,
             args.file_size,
             args.compress,
+            args.keep_days,
             receiver,
             ch.clone()
         ),
