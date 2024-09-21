@@ -7,35 +7,28 @@ use tokio::select;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
-async fn handle_out(
-    mut out: impl AsyncRead + Unpin,
-    sender: mpsc::Sender<Vec<u8>>,
-    mut cr: broadcast::Receiver<()>,
-) {
+async fn handle_out(mut out: impl AsyncRead + Unpin, name: &str, sender: mpsc::Sender<Vec<u8>>) {
     loop {
         let mut buf = Vec::new();
         select! {
             res = out.read_buf(&mut buf) => {// Read the output from the child process
                 if buf.len()>0 {
                   if let Err(err) = sender.send(buf).await { // Send the output to the receiver
-                      log!("write failed: {:+?}", err);
+                      log!("{} write failed: {:+?}", name, err);
                   }
                 }
                 match res {
                     Ok(size) => {
                         if size == 0 {
-                          log!("stdio closed");
+                          log!("{} closed", name);
                           break;
                         }
                     },
                     Err(err) => {
-                        log!("read failed: {:+?}", err);
+                        log!("{} read failed: {:+?}", name, err);
                         break;
                     }
                 }
-            }
-            _ = cr.recv() => {
-                break;
             }
         }
     }
@@ -47,17 +40,21 @@ pub async fn spawn(args: Vec<String>, sender: mpsc::Sender<Vec<u8>>, ch: broadca
     command.stdin(Stdio::inherit());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+
     let mut child = command.spawn().expect("failed to spawn child process");
+    let mut joins = Vec::new();
 
     if let Some(stdout) = child.stdout {
         let sender = sender.clone();
-        tokio::spawn(handle_out(stdout, sender, ch.subscribe()));
+        let join = tokio::spawn(handle_out(stdout, "stdout", sender));
+        joins.push(join);
         child.stdout = None;
     }
 
     if let Some(stderr) = child.stderr {
         let sender = sender.clone();
-        tokio::spawn(handle_out(stderr, sender, ch.subscribe()));
+        let join = tokio::spawn(handle_out(stderr, "stderr", sender));
+        joins.push(join);
         child.stderr = None;
     }
 
@@ -65,9 +62,16 @@ pub async fn spawn(args: Vec<String>, sender: mpsc::Sender<Vec<u8>>, ch: broadca
 
     select! {
         _ = child.wait() => {
-            log!("child exited");
-            // ch.send(()).expect("failed to send exit signal");
+            log!("child process exited");
         },
         _ = cr.recv() => {}
+    }
+    for j in joins {
+        match j.await {
+            Err(err) => {
+                log!("join failed: {:+?}", err);
+            }
+            _ => {}
+        }
     }
 }

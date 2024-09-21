@@ -465,6 +465,6 @@ pub async fn start(
         write_all(&mut rotate, &t);
     }
     rotate.close();
-    log!("closed rotation!");
+    log!("closed rotation handler");
     let _ = ch.send(());
 }
