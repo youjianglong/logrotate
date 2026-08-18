@@ -5,13 +5,9 @@ use libflate::gzip::Encoder;
 use std::cell::RefCell;
 use std::fs;
 use std::io;
-use std::io::Error;
 use std::io::{copy, ErrorKind, Write};
 use std::path;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
-
-use crate::utils;
 
 #[derive(Clone, Debug, ValueEnum)]
 pub(crate) enum CutMode {
@@ -20,6 +16,7 @@ pub(crate) enum CutMode {
 }
 
 const DATE_FMT: &str = "%Y%m%d"; // Date format: Year-Month-Day
+const DATE_LEN: usize = 8;
 
 // Returns the current day as a string in a specific format
 fn day() -> String {
@@ -34,26 +31,26 @@ fn date_add(days: i64) -> String {
 
 // Checks if a file exists at the given path
 fn is_file(path: &String) -> bool {
-    return fs::metadata(path).is_ok_and(|meta| meta.is_file());
+    fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 fn file_glob(file_path: &String) -> io::Result<Vec<String>> {
     let p = path::Path::new(&file_path);
-    let dir_path = p.parent();
+    let dir_path = p.parent().filter(|dir| !dir.as_os_str().is_empty());
     let base_path = p.file_name();
-    if dir_path.is_none() {
-        return Err(Error::new(ErrorKind::Other, "invalid file path"));
-    }
     if base_path.is_none() {
-        return Err(Error::new(ErrorKind::Other, "invalid file name"));
+        return Err(io::Error::other("invalid file name"));
     }
-    let dir = dir_path.unwrap();
+    let dir = dir_path.unwrap_or_else(|| path::Path::new("."));
     if !dir.exists() {
-        return Err(Error::new(ErrorKind::NotFound, "directory does not exist"));
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            "directory does not exist",
+        ));
     }
     let bp = base_path.unwrap().to_str();
     if bp.is_none() {
-        return Err(Error::new(ErrorKind::Other, "invalid base directory"));
+        return Err(io::Error::other("invalid base directory"));
     }
     let base_path: String = bp.unwrap().to_string();
     let mut files = vec![];
@@ -64,20 +61,17 @@ fn file_glob(file_path: &String) -> io::Result<Vec<String>> {
                 if let Some(s) = dir.join(&file_name).as_os_str().to_str() {
                     files.push(s.to_string());
                 } else {
-                    return Err(Error::new(
-                        ErrorKind::Other,
-                        format!("invalid file name: {}", &file_name),
-                    ));
+                    return Err(io::Error::other(format!("invalid file name: {file_name}")));
                 }
             }
         } else {
-            return Err(Error::new(
-                ErrorKind::Other,
-                format!("invalid file name: {:?}", de.file_name()),
-            ));
+            return Err(io::Error::other(format!(
+                "invalid file name: {:?}",
+                de.file_name()
+            )));
         }
     }
-    return Ok(files);
+    Ok(files)
 }
 
 // Opens a file at the given path and returns a tuple containing the file handle and its metadata
@@ -101,12 +95,11 @@ fn open_file(path: &str) -> io::Result<(File, Option<fs::Metadata>)> {
 
 // Flushes the contents of the file handle to disk
 // Prints an error message if there is an error flushing the file
-fn file_flush(file: &Option<File>) {
+fn file_flush(file: &Option<File>) -> io::Result<()> {
     if let Some(mut fp) = file.as_ref() {
-        if let Err(err) = fp.flush() {
-            log!("failed to flush file: {:+?}", err)
-        }
+        fp.flush()?;
     }
+    Ok(())
 }
 
 fn gzip_encode(filename: &String) -> io::Result<()> {
@@ -120,11 +113,36 @@ fn gzip_encode(filename: &String) -> io::Result<()> {
     Ok(())
 }
 
-fn remove_log_files(file_path: &String, day: &String) {
-    let file_path = format!("{}.{}", file_path, day);
-    match file_glob(&file_path) {
+fn remove_expired_log_files(file_path: &String, keep_days: i64) {
+    let cutoff = date_add(-keep_days);
+    let file_prefix = format!("{}.", file_path);
+    let Some(base_name) = path::Path::new(file_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+    else {
+        return;
+    };
+    let archive_prefix = format!("{base_name}.");
+    match file_glob(&file_prefix) {
         Ok(files) => {
             for file in files {
+                let Some(file_name) = path::Path::new(&file)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                else {
+                    continue;
+                };
+                let Some(suffix) = file_name.strip_prefix(&archive_prefix) else {
+                    continue;
+                };
+                let Some(archive_day) = suffix.get(..DATE_LEN) else {
+                    continue;
+                };
+                if !archive_day.bytes().all(|byte| byte.is_ascii_digit())
+                    || archive_day > cutoff.as_str()
+                {
+                    continue;
+                }
                 match fs::remove_file(&file) {
                     Ok(_) => {
                         log!("removed file \"{}\"", &file);
@@ -170,8 +188,8 @@ pub trait Rotate {
 
     fn receiver(&mut self) -> &mut mpsc::Receiver<Vec<u8>>;
     fn get_file(&mut self, len: u64) -> io::Result<&mut File>;
-    fn flush(&mut self);
-    fn close(&mut self);
+    fn flush(&mut self) -> io::Result<()>;
+    fn close(&mut self) -> io::Result<()>;
 }
 
 #[derive(Debug)]
@@ -193,7 +211,7 @@ impl SizeRotate {
         compress: bool,
         keep_days: i64,
     ) -> Self {
-        let slo = file_size.or_else(|| Some(1024 * 1024 * 20)); // If file_size is None, set it to 20MB (default)
+        let slo = file_size.or(Some(1024 * 1024 * 20)); // If file_size is None, set it to 20MB (default)
 
         Self {
             path,
@@ -226,7 +244,7 @@ impl Rotate for SizeRotate {
                 self.cur_size = 0;
             }
         }
-        if self.cur_size + len <= self.size_limit {
+        if self.cur_size == 0 || self.cur_size.saturating_add(len) <= self.size_limit {
             // Check if the current size plus the new length is less than or equal to the size limit
             self.cur_size += len;
             return Ok(self.file.get_mut().as_mut().unwrap());
@@ -241,33 +259,32 @@ impl Rotate for SizeRotate {
 
         let new_filename = self.rotate_filename(&self.path, self.compress, true);
         log!("move file: {:?} -> {:?}", self.path, new_filename);
-        if let Err(err) = fs::rename(self.path.clone(), &new_filename) {
-            log!("failed to move the file: {:+?}", err)
-        } else {
-            if self.compress {
-                gzip_encode(&new_filename)?;
-            }
+        fs::rename(self.path.clone(), &new_filename)?;
+        if self.compress {
+            gzip_encode(&new_filename)?;
         }
 
         // drop the expired file
-        let expire_day = date_add(-self.keep_days);
-        remove_log_files(&self.path, &expire_day);
+        if self.keep_days > 0 {
+            remove_expired_log_files(&self.path, self.keep_days);
+        }
 
         self.get_file(len)
     }
 
     // Flushes the file to disk.
     #[inline]
-    fn flush(&mut self) {
+    fn flush(&mut self) -> io::Result<()> {
         let fp = self.file.borrow_mut();
-        file_flush(&fp);
+        file_flush(&fp)
     }
 
     // Closes the file by flushing it and dropping the file handle.
     #[inline]
-    fn close(&mut self) {
-        self.flush();
+    fn close(&mut self) -> io::Result<()> {
+        self.flush()?;
         drop(self.file.take());
+        Ok(())
     }
 }
 
@@ -313,7 +330,7 @@ impl Rotate for DailyRotate {
     // If the file is not open, it opens the file and sets the create_day field
     // If the current day is different from the create_day, it rotates the file by flushing, renaming, and opening a new file
     // Returns a mutable reference to the file
-    fn get_file(&mut self, len: u64) -> io::Result<&mut File> {
+    fn get_file(&mut self, _len: u64) -> io::Result<&mut File> {
         let day = day(); // Get the current day
         if self.file.get_mut().is_none() {
             let (fp, exists) = open_file(self.path.as_str())?; // Open the file
@@ -339,31 +356,30 @@ impl Rotate for DailyRotate {
 
         let new_filename = self.rotate_filename(&self.path, self.compress, false);
         log!("move file: {:?} -> {:?}", self.path, new_filename);
-        if let Err(err) = fs::rename(self.path.clone(), &new_filename) {
-            log!("failed to move the file: {:+?}", err);
-        } else {
-            if self.compress {
-                gzip_encode(&new_filename)?;
-            }
+        fs::rename(self.path.clone(), &new_filename)?;
+        if self.compress {
+            gzip_encode(&new_filename)?;
         }
         // drop the expired file
-        let expire_day = date_add(-self.keep_days);
-        remove_log_files(&self.path, &expire_day);
-        self.get_file(len)
+        if self.keep_days > 0 {
+            remove_expired_log_files(&self.path, self.keep_days);
+        }
+        self.get_file(_len)
     }
 
     // Flushes the current file
     #[inline]
-    fn flush(&mut self) {
+    fn flush(&mut self) -> io::Result<()> {
         let fp = self.file.borrow_mut();
-        file_flush(&fp);
+        file_flush(&fp)
     }
 
     // Closes the file by flushing it and dropping the file handle
     #[inline]
-    fn close(&mut self) {
-        self.flush();
+    fn close(&mut self) -> io::Result<()> {
+        self.flush()?;
         drop(self.file.take());
+        Ok(())
     }
 }
 
@@ -376,41 +392,30 @@ pub fn new(
     compress: bool,
     keep_days: i64,
     receiver: mpsc::Receiver<Vec<u8>>,
-) -> Box<dyn Rotate + Send> {
+) -> io::Result<Box<dyn Rotate + Send>> {
     let log_path = match file_path {
         Some(s) => s,
         None => String::from("logs/out"),
     };
     if let Some(log_dir) = path::Path::new(&log_path).parent() {
-        if !log_dir.exists() {
-            if let Err(err) = fs::create_dir_all(log_dir) {
-                panic!("failed to create log directory: {:+?}", err)
-            }
+        if !log_dir.as_os_str().is_empty() && !log_dir.exists() {
+            fs::create_dir_all(log_dir)?;
         }
     }
     match mode {
         CutMode::Size => {
             let r = SizeRotate::new(log_path, receiver, file_size, compress, keep_days);
-            Box::new(r)
+            Ok(Box::new(r))
         }
         CutMode::Daily => {
             let r = DailyRotate::new(log_path, receiver, compress, keep_days);
-            Box::new(r)
+            Ok(Box::new(r))
         }
     }
 }
 
-fn write_all(rotate: &mut Box<dyn Rotate + Send>, data: &[u8]) {
-    match rotate.get_file(data.len() as u64) {
-        Ok(fp) => {
-            if let Err(err) = fp.write_all(data) {
-                log!("failed to write content to file: {:+?}", err);
-            }
-        }
-        Err(err) => {
-            log!("failed to open file: {:+?}", err);
-        }
-    }
+fn write_all(rotate: &mut Box<dyn Rotate + Send>, data: &[u8]) -> io::Result<()> {
+    rotate.get_file(data.len() as u64)?.write_all(data)
 }
 
 pub async fn start(
@@ -420,51 +425,14 @@ pub async fn start(
     compress: bool,
     keep_days: i64,
     receiver: mpsc::Receiver<Vec<u8>>,
-    ch: broadcast::Sender<()>,
-) {
+) -> io::Result<()> {
     let mut rotate = new(
         file_path, cut_mode, file_size, compress, keep_days, receiver,
-    );
-    let mut tail = None;
-    loop {
-        match rotate.receiver().recv().await {
-            Some(mut data) => {
-                let last_tail = tail.take();
-                if data[data.len() - 1] != b'\n' {
-                    if let Some(index) = data.iter().rposition(|&x| x == b'\n') {
-                        tail = Some(data[index + 1..].to_vec());
-                        data.truncate(index + 1);
-                    }
-                }
-                let mut lines = utils::Lines::new(data.as_slice());
-                if last_tail.is_some() {
-                    if let Some(i) = lines.next() {
-                        let mut line = last_tail.unwrap();
-                        line.append(&mut i.to_vec());
-                        write_all(&mut rotate, line.as_slice());
-                    } else {
-                        if tail.is_some() {
-                            let mut t1 = last_tail.unwrap();
-                            let mut t2 = tail.unwrap();
-                            t1.append(&mut t2);
-                            tail = Some(t1);
-                        }
-                        continue;
-                    }
-                }
-                lines.for_each(|line| {
-                    write_all(&mut rotate, line);
-                });
-            }
-            None => {
-                break;
-            }
-        }
+    )?;
+    while let Some(data) = rotate.receiver().recv().await {
+        write_all(&mut rotate, &data)?;
     }
-    if let Some(t) = tail {
-        write_all(&mut rotate, &t);
-    }
-    rotate.close();
+    rotate.close()?;
     log!("closed rotation handler");
-    let _ = ch.send(());
+    Ok(())
 }
