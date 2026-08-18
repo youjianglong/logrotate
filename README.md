@@ -78,6 +78,32 @@ key `keep_num` remains accepted when `keep_days` is absent.
 
 Run `logrotate --help` for the environment-variable names and all options.
 
+## Child-process restart
+
+Enable supervised restarts for abnormal child exits with `--restart`. The
+restart count is the number of retries after the initial process. If
+`--restart-count` is omitted, retries are unlimited; an explicitly supplied
+`0` disables retries. The interval accepts `ms`, `s`, `m`, or `h` and defaults to
+`1s`:
+
+```sh
+logrotate --restart --restart-count 5 --restart-interval 2s -- my-app
+```
+
+The same settings can be placed in TOML or environment variables:
+
+```toml
+restart = true
+# Omit restart_count for unlimited retries.
+restart_count = 5
+restart_interval = "2s"
+```
+
+They correspond to `LOG_ROTATE_RESTART`, `LOG_ROTATE_RESTART_COUNT`, and
+`LOG_ROTATE_RESTART_INTERVAL`. A normal exit (code 0) is never restarted. When
+the retry limit is reached, the last abnormal exit code is returned. Ctrl+C
+cancels the supervision loop and does not start another child.
+
 ## Exit status
 
 In command mode, `logrotate` returns the child process's exit code. On Unix, a

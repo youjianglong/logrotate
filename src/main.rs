@@ -15,6 +15,7 @@ use std::process::ExitStatus;
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 type AppResult<T> = Result<T, Box<dyn Error>>;
 type Writer = (mpsc::Sender<Vec<u8>>, JoinHandle<io::Result<()>>);
@@ -100,6 +101,75 @@ async fn run_stdin(config: &RuntimeConfig) -> AppResult<i32> {
     Ok(exit_code)
 }
 
+async fn supervise(
+    config: &RuntimeConfig,
+    stdout_sender: &mpsc::Sender<Vec<u8>>,
+    stderr_sender: &mpsc::Sender<Vec<u8>>,
+    stdout_options: PrefixOptions,
+    stderr_options: PrefixOptions,
+) -> AppResult<i32> {
+    let mut retries = 0;
+    loop {
+        let result = pm::spawn(
+            config.command.clone(),
+            stdout_sender.clone(),
+            stderr_sender.clone(),
+            stdout_options,
+            stderr_options,
+        )
+        .await;
+
+        match result {
+            Ok(outcome) => {
+                if outcome.interrupted || outcome.status.success() || !config.restart {
+                    return Ok(exit_code(outcome.status));
+                }
+                if config
+                    .restart_count
+                    .is_some_and(|restart_count| retries >= restart_count)
+                {
+                    return Ok(exit_code(outcome.status));
+                }
+                retries += 1;
+                let retry_limit = config
+                    .restart_count
+                    .map_or_else(|| "unlimited".to_string(), |count| count.to_string());
+                log!(
+                    "child exited abnormally; restarting ({}/{})",
+                    retries,
+                    retry_limit
+                );
+            }
+            Err(error) => {
+                if !config.restart
+                    || config
+                        .restart_count
+                        .is_some_and(|restart_count| retries >= restart_count)
+                {
+                    return Err(error.into());
+                }
+                retries += 1;
+                let retry_limit = config
+                    .restart_count
+                    .map_or_else(|| "unlimited".to_string(), |count| count.to_string());
+                log!(
+                    "child failed to run: {error}; restarting ({}/{})",
+                    retries,
+                    retry_limit
+                );
+            }
+        }
+
+        tokio::select! {
+            _ = sleep(config.restart_interval) => {},
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                return Ok(130);
+            }
+        }
+    }
+}
+
 async fn run_process(config: &RuntimeConfig) -> AppResult<i32> {
     let stdout_path = config.stdout_path();
     let stderr_path = config.stderr_path();
@@ -109,26 +179,26 @@ async fn run_process(config: &RuntimeConfig) -> AppResult<i32> {
         stream_label,
     };
 
-    let (status, writer_result) = if shared {
+    let (process_result, writer_result) = if shared {
         let (sender, writer) = start_writer(&stdout_path, config)?;
-        let status = pm::spawn(
-            config.command.clone(),
-            sender.clone(),
-            sender.clone(),
+        let process_result = supervise(
+            config,
+            &sender,
+            &sender,
             prefix(config.stream_label),
             prefix(config.stream_label),
         )
         .await;
         drop(sender);
         let writer_result = wait_writer(writer).await;
-        (status, writer_result)
+        (process_result, writer_result)
     } else {
         let (stdout_sender, stdout_writer) = start_writer(&stdout_path, config)?;
         let (stderr_sender, stderr_writer) = start_writer(&stderr_path, config)?;
-        let status = pm::spawn(
-            config.command.clone(),
-            stdout_sender.clone(),
-            stderr_sender.clone(),
+        let process_result = supervise(
+            config,
+            &stdout_sender,
+            &stderr_sender,
             prefix(false),
             prefix(false),
         )
@@ -137,12 +207,11 @@ async fn run_process(config: &RuntimeConfig) -> AppResult<i32> {
         drop(stderr_sender);
         let (stdout_result, stderr_result) =
             tokio::join!(wait_writer(stdout_writer), wait_writer(stderr_writer));
-        (status, stdout_result.and(stderr_result))
+        (process_result, stdout_result.and(stderr_result))
     };
 
     writer_result?;
-    let status = status?;
-    Ok(exit_code(status))
+    process_result
 }
 
 fn exit_code(status: ExitStatus) -> i32 {

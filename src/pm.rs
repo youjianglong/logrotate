@@ -6,6 +6,11 @@ use tokio::process::Command;
 use tokio::signal::ctrl_c;
 use tokio::sync::mpsc;
 
+pub struct ChildOutcome {
+    pub status: ExitStatus,
+    pub interrupted: bool,
+}
+
 async fn send(sender: &mpsc::Sender<Vec<u8>>, records: Vec<Vec<u8>>) -> io::Result<()> {
     for record in records {
         sender.send(record).await.map_err(|_| {
@@ -60,7 +65,7 @@ pub async fn spawn(
     stderr_sender: mpsc::Sender<Vec<u8>>,
     stdout_options: PrefixOptions,
     stderr_options: PrefixOptions,
-) -> io::Result<ExitStatus> {
+) -> io::Result<ChildOutcome> {
     let mut process = Command::new(&command[0]);
     process
         .args(&command[1..])
@@ -96,14 +101,14 @@ pub async fn spawn(
         stderr_sender,
     ));
 
-    let status = tokio::select! {
-        status = child.wait() => status?,
+    let (status, interrupted) = tokio::select! {
+        status = child.wait() => (status?, false),
         signal = ctrl_c() => {
             signal?;
             if let Err(error) = interrupt_child(&mut child) {
                 log!("failed to forward Ctrl+C to child: {error}");
             }
-            child.wait().await?
+            (child.wait().await?, true)
         }
     };
 
@@ -113,5 +118,8 @@ pub async fn spawn(
     stderr_task
         .await
         .map_err(|e| io::Error::other(format!("stderr reader task failed: {e}")))??;
-    Ok(status)
+    Ok(ChildOutcome {
+        status,
+        interrupted,
+    })
 }

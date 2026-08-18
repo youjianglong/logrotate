@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 use toml::Table;
 
 const DEFAULT_OUTPUT: &str = "logs/out";
@@ -84,6 +85,66 @@ impl FromStr for ByteSize {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestartInterval(pub Duration);
+
+impl FromStr for RestartInterval {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        let split = value
+            .find(|c: char| c.is_ascii_alphabetic())
+            .ok_or_else(|| format!("interval must include a unit: {value}"))?;
+        let (number, suffix) = value.split_at(split);
+        let multiplier = match suffix.to_ascii_lowercase().as_str() {
+            "ms" => 1_000_000_u128,
+            "s" => 1_000_000_000_u128,
+            "m" => 60 * 1_000_000_000_u128,
+            "h" => 60 * 60 * 1_000_000_000_u128,
+            _ => return Err(format!("unsupported interval unit: {suffix}")),
+        };
+        let mut parts = number.split('.');
+        let whole = parts
+            .next()
+            .filter(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+            .ok_or_else(|| format!("invalid interval: {value}"))?;
+        let fraction = parts.next();
+        if parts.next().is_some()
+            || fraction
+                .is_some_and(|part| part.is_empty() || !part.chars().all(|c| c.is_ascii_digit()))
+        {
+            return Err(format!("invalid interval: {value}"));
+        }
+        let whole: u128 = whole
+            .parse()
+            .map_err(|_| format!("interval is too large: {value}"))?;
+        let mut nanos = whole
+            .checked_mul(multiplier)
+            .ok_or_else(|| format!("interval is too large: {value}"))?;
+        if let Some(fraction) = fraction {
+            let scale = 10_u128
+                .checked_pow(fraction.len() as u32)
+                .ok_or_else(|| format!("interval is too precise: {value}"))?;
+            let fraction: u128 = fraction
+                .parse()
+                .map_err(|_| format!("invalid interval: {value}"))?;
+            nanos = nanos
+                .checked_add(
+                    fraction
+                        .checked_mul(multiplier)
+                        .ok_or_else(|| format!("interval is too large: {value}"))?
+                        / scale,
+                )
+                .ok_or_else(|| format!("interval is too large: {value}"))?;
+        }
+        if nanos > u64::MAX as u128 {
+            return Err(format!("interval is too large: {value}"));
+        }
+        Ok(Self(Duration::from_nanos(nanos as u64)))
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(version, author, about = "Rotate stdin or child-process logs")]
 pub struct Args {
@@ -131,6 +192,18 @@ pub struct Args {
     #[arg(long, env = "LOG_ROTATE_DEBUG", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
     debug: Option<bool>,
 
+    /// Restart a child after an abnormal exit
+    #[arg(long, env = "LOG_ROTATE_RESTART", num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    restart: Option<bool>,
+
+    /// Maximum number of restarts after abnormal exits; omit for unlimited
+    #[arg(long, env = "LOG_ROTATE_RESTART_COUNT")]
+    restart_count: Option<u32>,
+
+    /// Delay between restarts, e.g. 500ms, 2s, or 1m
+    #[arg(long, env = "LOG_ROTATE_RESTART_INTERVAL")]
+    restart_interval: Option<RestartInterval>,
+
     /// Command and arguments. Use `-- command --arg` for commands with options.
     #[arg(
         value_name = "COMMAND",
@@ -152,6 +225,9 @@ pub struct RuntimeConfig {
     pub timestamp_prefix: bool,
     pub stream_label: bool,
     pub debug: bool,
+    pub restart: bool,
+    pub restart_count: Option<u32>,
+    pub restart_interval: Duration,
     pub command: Vec<String>,
 }
 
@@ -203,6 +279,40 @@ fn boolean(table: &Table, key: &str) -> Result<Option<bool>, ConfigError> {
                 .ok_or_else(|| ConfigError(format!("config `{key}` must be a boolean")))
         })
         .transpose()
+}
+
+fn unsigned(table: &Table, key: &str) -> Result<Option<u32>, ConfigError> {
+    table
+        .get(key)
+        .map(|v| {
+            v.as_integer()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    ConfigError(format!("config `{key}` must be a non-negative integer"))
+                })
+        })
+        .transpose()
+}
+
+fn configured_interval(table: &Table) -> Result<Option<RestartInterval>, ConfigError> {
+    let Some(value) = table.get("restart_interval") else {
+        return Ok(None);
+    };
+    if let Some(value) = value.as_integer() {
+        return u64::try_from(value)
+            .map(|milliseconds| RestartInterval(Duration::from_millis(milliseconds)))
+            .map(Some)
+            .map_err(|_| ConfigError("config `restart_interval` is too large".into()));
+    }
+    if let Some(value) = value.as_str() {
+        return value
+            .parse()
+            .map(Some)
+            .map_err(|e: String| ConfigError(format!("invalid config `restart_interval`: {e}")));
+    }
+    Err(ConfigError(
+        "config `restart_interval` must be milliseconds or a duration string".into(),
+    ))
 }
 
 fn integer(table: &Table, key: &str) -> Result<Option<i64>, ConfigError> {
@@ -346,13 +456,24 @@ fn resolve(args: Args) -> Result<RuntimeConfig, ConfigError> {
             .or(boolean(&table, "stream_label")?)
             .unwrap_or(false),
         debug: args.debug.or(boolean(&table, "debug")?).unwrap_or(false),
+        restart: args
+            .restart
+            .or(boolean(&table, "restart")?)
+            .unwrap_or(false),
+        restart_count: args.restart_count.or(unsigned(&table, "restart_count")?),
+        restart_interval: args
+            .restart_interval
+            .or(configured_interval(&table)?)
+            .unwrap_or(RestartInterval(Duration::from_secs(1)))
+            .0,
         command,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ByteSize;
+    use super::{ByteSize, RestartInterval};
+    use std::time::Duration;
 
     #[test]
     fn parses_human_sizes_using_binary_multipliers() {
@@ -368,5 +489,18 @@ mod tests {
         for value in ["", "0", "-1MB", "1.2.3MB", "1XB", ".5MB"] {
             assert!(value.parse::<ByteSize>().is_err(), "accepted {value}");
         }
+    }
+
+    #[test]
+    fn parses_restart_intervals() {
+        assert_eq!(
+            "500ms".parse::<RestartInterval>().unwrap().0,
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            "1.5s".parse::<RestartInterval>().unwrap().0,
+            Duration::from_millis(1500)
+        );
+        assert!("10".parse::<RestartInterval>().is_err());
     }
 }

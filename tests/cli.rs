@@ -49,6 +49,9 @@ fn command() -> Command {
         "LOG_ROTATE_TIMESTAMP_PREFIX",
         "LOG_ROTATE_STREAM_LABEL",
         "LOG_ROTATE_DEBUG",
+        "LOG_ROTATE_RESTART",
+        "LOG_ROTATE_RESTART_COUNT",
+        "LOG_ROTATE_RESTART_INTERVAL",
     ] {
         command.env_remove(variable);
     }
@@ -233,4 +236,110 @@ fn command_line_overrides_environment_and_toml() {
     assert!(status.success());
     assert_eq!(contents(env_output), b"env");
     assert!(!config_output.exists());
+}
+
+#[test]
+fn restarts_abnormal_child_until_it_succeeds() {
+    let dir = TestDir::new("restart-success");
+    let output = dir.join("restart.log");
+    let marker = dir.join("started");
+    let script = "if [ -f \"$1\" ]; then printf 'second\\n'; exit 0; else : > \"$1\"; printf 'first\\n'; exit 3; fi";
+    let status = command()
+        .args([
+            "--output",
+            output.to_str().unwrap(),
+            "--restart",
+            "--restart-count",
+            "2",
+            "--restart-interval",
+            "1ms",
+            "--",
+            "sh",
+            "-c",
+            script,
+            "sh",
+            marker.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    assert_eq!(contents(output), b"first\nsecond\n");
+}
+
+#[test]
+fn restart_without_a_count_is_unlimited() {
+    let dir = TestDir::new("restart-unlimited");
+    let output = dir.join("restart.log");
+    let marker = dir.join("started");
+    let script = "if [ -f \"$1\" ]; then printf 'done\\n'; exit 0; else : > \"$1\"; exit 3; fi";
+    let status = command()
+        .args([
+            "--output",
+            output.to_str().unwrap(),
+            "--restart",
+            "--restart-interval",
+            "1ms",
+            "--",
+            "sh",
+            "-c",
+            script,
+            "sh",
+            marker.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    assert_eq!(contents(output), b"done\n");
+}
+
+#[test]
+fn returns_last_abnormal_status_when_retries_are_exhausted() {
+    let dir = TestDir::new("restart-exhausted");
+    let output = dir.join("restart.log");
+    let marker = dir.join("attempts");
+    let script = "n=$(cat \"$1\" 2>/dev/null || echo 0); n=$((n + 1)); printf '%s\\n' \"$n\" > \"$1\"; printf 'attempt%s\\n' \"$n\"; exit 4";
+    let status = command()
+        .args([
+            "--output",
+            output.to_str().unwrap(),
+            "--restart",
+            "--restart-count",
+            "1",
+            "--restart-interval",
+            "1ms",
+            "--",
+            "sh",
+            "-c",
+            script,
+            "sh",
+            marker.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+
+    assert_eq!(status.code(), Some(4));
+    assert_eq!(contents(output), b"attempt1\nattempt2\n");
+}
+
+#[test]
+fn reads_restart_policy_from_toml() {
+    let dir = TestDir::new("restart-config");
+    let output = dir.join("restart.log");
+    let marker = dir.join("started");
+    let config = dir.join("restart.toml");
+    fs::write(
+        &config,
+        format!(
+            "output = \"{}\"\nrestart = true\nrestart_count = 1\nrestart_interval = \"1ms\"\nexec = [\"sh\", \"-c\", \"if [ -f $0 ]; then printf 'ok\\\\n'; exit 0; else : > $0; exit 2; fi\", \"{}\"]\n",
+            output.display(),
+            marker.display()
+        ),
+    )
+    .unwrap();
+
+    let status = command().arg("--config").arg(config).status().unwrap();
+    assert!(status.success());
+    assert_eq!(contents(output), b"ok\n");
 }
